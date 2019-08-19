@@ -1,4 +1,5 @@
 import pathlib
+import functools
 
 import cv2
 import numpy as np
@@ -8,6 +9,7 @@ import torchvision.transforms.functional as TF
 
 from src.hrnet import HRNet
 from src.heads import SegHead
+from src.loss import dice_loss
 
 
 def extract_mask(raw_png):
@@ -34,6 +36,23 @@ def save_model(model, path):
     torch.save(model.state_dict(), path)
 
 
+def calc_loss(epoch, pred, label):
+    car_pred, lane_pred = pred[:, 0:1], pred[:, 1:2]
+    car_label, lane_label = label[:, 0:1], label[:, 1:2]
+    bce_loss = torch.nn.BCEWithLogitsLoss()
+    losses = {
+        "car_bce_loss": bce_loss(car_pred, car_label) * 5.0,
+        "car_dice_loss": dice_loss(car_pred, car_label) * 0.1,
+        "lane_bce_loss": bce_loss(lane_pred, lane_label) * 5.0,
+        "lane_dice_loss": dice_loss(lane_pred, lane_label) * 0.1,
+    }
+    total_loss = functools.reduce(lambda x, y: x + y, [l for n, l in losses.items()])
+    print(f"[epoch {epoch}] total_loss: {total_loss:.4f}")
+    for n, l in losses.items():
+        print(f"{n:15}: {l.item():.4f}")
+    return total_loss
+
+
 def train():
     im = read_im().cuda()
     label = read_seglabel().cuda()
@@ -46,16 +65,13 @@ def train():
     model.cuda()
     optimizer = torch.optim.SGD(model.parameters(), lr=0.001, momentum=0.9)
     lr_scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer, [500, 800])
-    for i in range(1000):
+    for epoch in range(1000):
         optimizer.zero_grad()
         out = model(im)
-        car_loss = torch.nn.BCEWithLogitsLoss()(out[:, 0], label[:, 0])
-        lane_loss = torch.nn.BCEWithLogitsLoss()(out[:, 1], label[:, 1])
-        loss = car_loss + lane_loss
-        print(f"[{i:04}] {'car_loss':10}: {car_loss.item():.4f}, {'lane_loss':10}: {lane_loss.item():.4f}, total_loss: {loss.item():.4f}")
-        loss.backward()
+        total_loss = calc_loss(epoch, out, label)
+        total_loss.backward()
         optimizer.step()
-        lr_scheduler.step(i)
+        lr_scheduler.step(epoch)
 
     save_model(model, 'checkpoints/hrnet/final_model.pth')
 
