@@ -49,8 +49,10 @@ def train():
     for i in range(1000):
         optimizer.zero_grad()
         out = model(im)
-        loss = torch.nn.BCEWithLogitsLoss()(out, label)
-        print(f"[{i:04}] loss = {loss.item():.5f}")
+        car_loss = torch.nn.BCEWithLogitsLoss()(out[:, 0], label[:, 0])
+        lane_loss = torch.nn.BCEWithLogitsLoss()(out[:, 1], label[:, 1])
+        loss = car_loss + lane_loss
+        print(f"[{i:04}] {'car_loss':10}: {car_loss.item():.4f}, {'lane_loss':10}: {lane_loss.item():.4f}, total_loss: {loss.item():.4f}")
         loss.backward()
         optimizer.step()
         lr_scheduler.step(i)
