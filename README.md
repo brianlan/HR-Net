@@ -1,8 +1,9 @@
 # HR-Net
 
-A Simple PyTorch implementation of paper [High-Resolution Representations for Labeling Pixels and Regions](https://arxiv.org/abs/1904.04514)
+A Simple PyTorch implementation based on paper [High-Resolution Representations for Labeling Pixels and Regions](https://arxiv.org/abs/1904.04514)
+Did some modifications on the ResBlock to save computation. 
 
-This repo is only a demo of showing the HR-Net implementation is basically runable.
+This repo is only a demo of showing the implementation is basically working...
 
 ### Input Image
 I only labeled two classes: car and lane line.
