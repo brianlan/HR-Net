@@ -7,7 +7,7 @@ import numpy as np
 import torch
 import torchvision.transforms.functional as TF
 
-from src.hrnet import HRNet
+from src.hrnet import HighResolutionNet, HigherResolutionNet
 from src.heads import SegHead
 
 
@@ -23,12 +23,12 @@ def evaluate():
     im = read_im().cuda()
 
     model = torch.nn.Sequential(
-        HRNet(upsample_mode='bilinear'),
-        SegHead(360, 2),
-        torch.nn.Upsample(scale_factor=4, mode='bilinear')
+        HigherResolutionNet(upsample_mode='bilinear'),
+        SegHead(372, 2),
+        torch.nn.Upsample(scale_factor=2, mode='bilinear')
     )
 
-    model.load_state_dict(torch.load('checkpoints/hrnet/final_model.pth'))
+    model.load_state_dict(torch.load('checkpoints/hrnet/higher_resolution_final_model.pth'))
     model.cuda()
 
     with torch.no_grad():

@@ -7,7 +7,7 @@ from PIL import Image
 import torch
 import torchvision.transforms.functional as TF
 
-from src.hrnet import HRNet
+from src.hrnet import HighResolutionNet, HigherResolutionNet
 from src.heads import SegHead
 from src.loss import dice_loss
 
@@ -57,9 +57,9 @@ def train():
     im = read_im().cuda()
     label = read_seglabel().cuda()
     model = torch.nn.Sequential(
-        HRNet(upsample_mode='bilinear'),
-        SegHead(360, 2),
-        torch.nn.Upsample(scale_factor=4, mode='bilinear')
+        HigherResolutionNet(upsample_mode='bilinear'),
+        SegHead(372, 2),
+        torch.nn.Upsample(scale_factor=2, mode='bilinear')
     )
     model.train()
     model.cuda()
@@ -73,7 +73,7 @@ def train():
         optimizer.step()
         lr_scheduler.step(epoch)
 
-    save_model(model, 'checkpoints/hrnet/final_model.pth')
+    save_model(model, 'checkpoints/hrnet/higher_resolution_final_model.pth')
 
 
 if __name__ == '__main__':
