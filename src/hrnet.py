@@ -39,7 +39,7 @@ class HRChannelExpandSpatialDownsample(nn.Module):
 
 class HRChannelShrinkSpatialUpsample(nn.Module):
     def __init__(
-            self, in_channels, out_channels=None, upsample_rate=1, min_channels_of_a_grp=4, upsample_mode='nearest'
+        self, in_channels, out_channels=None, upsample_rate=1, min_channels_of_a_grp=4, upsample_mode="nearest"
     ):
         super().__init__()
         out_channels = out_channels or in_channels
@@ -93,7 +93,9 @@ class HRSplitConcatShuffleBlock(nn.Module):
         self.conv1 = nn.Conv2d(half_channels, half_channels, 1)
         self.bn1 = nn.BatchNorm2d(half_channels)
         self.relu1 = nn.ReLU()
-        self.conv2 = nn.Conv2d(half_channels, half_channels, 3, padding=1, groups=half_channels // min_channels_of_a_grp)
+        self.conv2 = nn.Conv2d(
+            half_channels, half_channels, 3, padding=1, groups=half_channels // min_channels_of_a_grp
+        )
         self.bn2 = nn.BatchNorm2d(half_channels)
         self.conv3 = nn.Conv2d(half_channels, half_channels, 1)
         self.bn3 = nn.BatchNorm2d(half_channels)
@@ -103,7 +105,7 @@ class HRSplitConcatShuffleBlock(nn.Module):
     def forward(self, x):
         c = x.shape[1]
         assert c % 2 == 0, f"channels must be a even number, but {c!r} is found."
-        x1, x2 = x[:, :c // 2, ...], x[:, c // 2:, ...]
+        x1, x2 = x[:, : c // 2, ...], x[:, c // 2 :, ...]
         x2 = self.relu1(self.bn1(self.conv1(x2)))
         x2 = self.bn2(self.conv2(x2))
         x2 = self.relu3(self.bn3(self.conv3(x2)))
@@ -112,16 +114,57 @@ class HRSplitConcatShuffleBlock(nn.Module):
         return x
 
 
+class ClassificationHead(nn.Module):
+    def __init__(self, layer_settings=None, expand_ratio=4, num_classes=1000, **kwargs):
+        super().__init__()
+        channels = [s[1] for s in layer_settings]
+        channels_exp = [c * expand_ratio for c in channels]
+        self.expand_layers = nn.Sequential(
+            HRResBlock(c, out_channels=c_exp) for c, c_exp in zip(channels, channels_exp)
+        )
+        self.downsample_layers = nn.Sequential(
+            HRChannelExpandSpatialDownsample(channels_exp[i], out_channels=channels_exp[i + 1])
+            for i in range(len(channels_exp) - 1)
+        )
+        final_feature_channels = channels_exp[-1] * 2
+        self.channel_double = nn.Conv2d(channels_exp[-1], final_feature_channels, kernel_size=1)
+        self.fc = nn.Linear(final_feature_channels, num_classes)
+
+    def forward(self, *inputs):
+        """inputs are fmaps from branches with different spatial sizes. They should be ordered from largest to smallest.
+        For example, r4 (56 x 56), r8 (28 x 28), r16 (14 x 14), r32 (7 x 7).
+        """
+        expanded_fmaps = [expand(i) for i, expand in zip(inputs, self.expand_layers)]
+        features = expanded_fmaps[0]
+        for i, downsample in enumerate(self.downsample_layers):
+            features = downsample(features) + features
+        features = self.channel_double(features)
+        features_flatten = F.adaptive_avg_pool2d(features, output_size=1).squeeze()
+        out = self.fc(features_flatten)
+        return out
+
+
+class SegmentationHead(nn.Module):
+    def __init__(self, layer_settings=None, upsample_mode="nearest", **kwargs):
+        super().__init__()
+        channels = [s[1] for s in layer_settings]
+        self.upsample_layers = nn.Sequential(
+            nn.Upsample(scale_factor=c / channels[0], mode=upsample_mode) for c in channels[1:]
+        )
+
+    def forward(self, *inputs):
+        """inputs are fmaps from branches with different spatial sizes. They should be ordered from largest to smallest.
+        For example, r4 (56 x 56), r8 (28 x 28), r16 (14 x 14), r32 (7 x 7).
+        """
+        upsampled_fmaps = [up(i) for i, up in zip(inputs[1:], self.upsample_layers)]
+        return torch.cat((inputs[0], *upsampled_fmaps), dim=1)
+
+
 class HighResolutionNet(nn.Module):
-    def __init__(self, layer_settings=None, upsample_mode='nearest'):
+    def __init__(self, head_cls=SegmentationHead, layer_settings=None, upsample_mode="nearest"):
         super().__init__()
         if layer_settings is None:
-            layer_settings = (
-                ("r4", 24, 4),
-                ("r8", 48, 4),
-                ("r16", 96, 4),
-                ("r32", 192, 4),
-            )
+            layer_settings = (("r4", 24, 4), ("r8", 48, 4), ("r16", 96, 4), ("r32", 192, 4))
         c4, c8, c16, c32 = [s[1] for s in layer_settings]
 
         ################
@@ -185,8 +228,12 @@ class HighResolutionNet(nn.Module):
         self.s3_r8r16 = HRChannelExpandSpatialDownsample(c8, out_channels=c16, downsample_rate=2)
         self.s3_r8r32 = HRChannelExpandSpatialDownsample(c8, out_channels=c32, downsample_rate=4)
         self.s3_r16r16 = HRSplitConcatShuffleBlock(c16)
-        self.s3_r16r4 = HRChannelShrinkSpatialUpsample(c16, out_channels=c4, upsample_rate=4, upsample_mode=upsample_mode)
-        self.s3_r16r8 = HRChannelShrinkSpatialUpsample(c16, out_channels=c8, upsample_rate=2, upsample_mode=upsample_mode)
+        self.s3_r16r4 = HRChannelShrinkSpatialUpsample(
+            c16, out_channels=c4, upsample_rate=4, upsample_mode=upsample_mode
+        )
+        self.s3_r16r8 = HRChannelShrinkSpatialUpsample(
+            c16, out_channels=c8, upsample_rate=2, upsample_mode=upsample_mode
+        )
         self.s3_r16r32 = HRChannelExpandSpatialDownsample(c16, out_channels=c32, downsample_rate=2)
 
         ################
@@ -217,21 +264,32 @@ class HighResolutionNet(nn.Module):
         self.s4_r8r16 = HRChannelExpandSpatialDownsample(c8, out_channels=c16, downsample_rate=2)
         self.s4_r8r32 = HRChannelExpandSpatialDownsample(c8, out_channels=c32, downsample_rate=4)
         self.s4_r16r16 = HRSplitConcatShuffleBlock(c16)
-        self.s4_r16r4 = HRChannelShrinkSpatialUpsample(c16, out_channels=c4, upsample_rate=4, upsample_mode=upsample_mode)
-        self.s4_r16r8 = HRChannelShrinkSpatialUpsample(c16, out_channels=c8, upsample_rate=2, upsample_mode=upsample_mode)
+        self.s4_r16r4 = HRChannelShrinkSpatialUpsample(
+            c16, out_channels=c4, upsample_rate=4, upsample_mode=upsample_mode
+        )
+        self.s4_r16r8 = HRChannelShrinkSpatialUpsample(
+            c16, out_channels=c8, upsample_rate=2, upsample_mode=upsample_mode
+        )
         self.s4_r16r32 = HRChannelExpandSpatialDownsample(c16, out_channels=c32, downsample_rate=2)
         self.s4_r32r32 = HRSplitConcatShuffleBlock(c32)
-        self.s4_r32r4 = HRChannelShrinkSpatialUpsample(c32, out_channels=c4, upsample_rate=8, upsample_mode=upsample_mode)
-        self.s4_r32r8 = HRChannelShrinkSpatialUpsample(c32, out_channels=c8, upsample_rate=4, upsample_mode=upsample_mode)
-        self.s4_r32r16 = HRChannelShrinkSpatialUpsample(c32, out_channels=c16, upsample_rate=2, upsample_mode=upsample_mode)
+        self.s4_r32r4 = HRChannelShrinkSpatialUpsample(
+            c32, out_channels=c4, upsample_rate=8, upsample_mode=upsample_mode
+        )
+        self.s4_r32r8 = HRChannelShrinkSpatialUpsample(
+            c32, out_channels=c8, upsample_rate=4, upsample_mode=upsample_mode
+        )
+        self.s4_r32r16 = HRChannelShrinkSpatialUpsample(
+            c32, out_channels=c16, upsample_rate=2, upsample_mode=upsample_mode
+        )
 
         ################
-        #    Final
+        #    Head
         ################
-        self.up_r8r4 = nn.Upsample(scale_factor=2, mode=upsample_mode)
-        self.up_r16r4 = nn.Upsample(scale_factor=4, mode=upsample_mode)
-        self.up_r32r4 = nn.Upsample(scale_factor=8, mode=upsample_mode)
+        self.head = head_cls(layer_settings=layer_settings, upsample_mode=upsample_mode)
 
+        ################################
+        #    Parameter Initialization
+        ################################
         self.initialize_params()
 
     def forward(self, x):
@@ -275,18 +333,14 @@ class HighResolutionNet(nn.Module):
         fused_r8 = self.s4_r4r8(r4) + self.s4_r8r8(r8) + self.s4_r16r8(r16) + self.s4_r32r8(r32)
         fused_r4 = self.s4_r4r4(r4) + self.s4_r8r4(r8) + self.s4_r16r4(r16) + self.s4_r32r4(r32)
 
-        # Final
-        r8_up = self.up_r8r4(fused_r8)
-        r16_up = self.up_r16r4(fused_r16)
-        r32_up = self.up_r32r4(fused_r32)
-
-        return torch.cat((fused_r4, r8_up, r16_up, r32_up), dim=1)
+        # Head
+        return self.head(fused_r4, fused_r8, fused_r16, fused_r32)
 
     def initialize_params(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight.data, mode='fan_in', nonlinearity='relu')
-                if hasattr(m, 'bias') and m.bias is not None:
+                nn.init.kaiming_normal_(m.weight.data, mode="fan_in", nonlinearity="relu")
+                if hasattr(m, "bias") and m.bias is not None:
                     m.bias.data.zero_()
             # !!!IMPORTANT: batchnorm must be initialized and initialized as follows to meet quantization requirements.
             elif isinstance(m, nn.BatchNorm1d) or isinstance(m, nn.BatchNorm2d):
@@ -297,16 +351,10 @@ class HighResolutionNet(nn.Module):
 
 
 class HigherResolutionNet(nn.Module):
-    def __init__(self, layer_settings=None, upsample_mode='nearest'):
+    def __init__(self, head_cls=SegmentationHead, layer_settings=None, upsample_mode="nearest"):
         super().__init__()
         if layer_settings is None:
-            layer_settings = (
-                ("r2", 12, 4),
-                ("r4", 24, 4),
-                ("r8", 48, 4),
-                ("r16", 96, 4),
-                ("r32", 192, 4),
-            )
+            layer_settings = (("r2", 12, 4), ("r4", 24, 4), ("r8", 48, 4), ("r16", 96, 4), ("r32", 192, 4))
         c2, c4, c8, c16, c32 = [s[1] for s in layer_settings]
 
         ################
@@ -398,9 +446,15 @@ class HigherResolutionNet(nn.Module):
         self.s3_r8r8 = HRSplitConcatShuffleBlock(c8)
         self.s3_r8r16 = HRChannelExpandSpatialDownsample(c8, out_channels=c16, downsample_rate=2)
         self.s3_r8r32 = HRChannelExpandSpatialDownsample(c8, out_channels=c32, downsample_rate=4)
-        self.s3_r16r2 = HRChannelShrinkSpatialUpsample(c16, out_channels=c2, upsample_rate=8, upsample_mode=upsample_mode)
-        self.s3_r16r4 = HRChannelShrinkSpatialUpsample(c16, out_channels=c4, upsample_rate=4, upsample_mode=upsample_mode)
-        self.s3_r16r8 = HRChannelShrinkSpatialUpsample(c16, out_channels=c8, upsample_rate=2, upsample_mode=upsample_mode)
+        self.s3_r16r2 = HRChannelShrinkSpatialUpsample(
+            c16, out_channels=c2, upsample_rate=8, upsample_mode=upsample_mode
+        )
+        self.s3_r16r4 = HRChannelShrinkSpatialUpsample(
+            c16, out_channels=c4, upsample_rate=4, upsample_mode=upsample_mode
+        )
+        self.s3_r16r8 = HRChannelShrinkSpatialUpsample(
+            c16, out_channels=c8, upsample_rate=2, upsample_mode=upsample_mode
+        )
         self.s3_r16r16 = HRSplitConcatShuffleBlock(c16)
         self.s3_r16r32 = HRChannelExpandSpatialDownsample(c16, out_channels=c32, downsample_rate=2)
 
@@ -442,25 +496,39 @@ class HigherResolutionNet(nn.Module):
         self.s4_r8r8 = HRSplitConcatShuffleBlock(c8)
         self.s4_r8r16 = HRChannelExpandSpatialDownsample(c8, out_channels=c16, downsample_rate=2)
         self.s4_r8r32 = HRChannelExpandSpatialDownsample(c8, out_channels=c32, downsample_rate=4)
-        self.s4_r16r2 = HRChannelShrinkSpatialUpsample(c16, out_channels=c2, upsample_rate=8, upsample_mode=upsample_mode)
-        self.s4_r16r4 = HRChannelShrinkSpatialUpsample(c16, out_channels=c4, upsample_rate=4, upsample_mode=upsample_mode)
-        self.s4_r16r8 = HRChannelShrinkSpatialUpsample(c16, out_channels=c8, upsample_rate=2, upsample_mode=upsample_mode)
+        self.s4_r16r2 = HRChannelShrinkSpatialUpsample(
+            c16, out_channels=c2, upsample_rate=8, upsample_mode=upsample_mode
+        )
+        self.s4_r16r4 = HRChannelShrinkSpatialUpsample(
+            c16, out_channels=c4, upsample_rate=4, upsample_mode=upsample_mode
+        )
+        self.s4_r16r8 = HRChannelShrinkSpatialUpsample(
+            c16, out_channels=c8, upsample_rate=2, upsample_mode=upsample_mode
+        )
         self.s4_r16r16 = HRSplitConcatShuffleBlock(c16)
         self.s4_r16r32 = HRChannelExpandSpatialDownsample(c16, out_channels=c32, downsample_rate=2)
-        self.s4_r32r2 = HRChannelShrinkSpatialUpsample(c32, out_channels=c2, upsample_rate=16, upsample_mode=upsample_mode)
-        self.s4_r32r4 = HRChannelShrinkSpatialUpsample(c32, out_channels=c4, upsample_rate=8, upsample_mode=upsample_mode)
-        self.s4_r32r8 = HRChannelShrinkSpatialUpsample(c32, out_channels=c8, upsample_rate=4, upsample_mode=upsample_mode)
-        self.s4_r32r16 = HRChannelShrinkSpatialUpsample(c32, out_channels=c16, upsample_rate=2, upsample_mode=upsample_mode)
+        self.s4_r32r2 = HRChannelShrinkSpatialUpsample(
+            c32, out_channels=c2, upsample_rate=16, upsample_mode=upsample_mode
+        )
+        self.s4_r32r4 = HRChannelShrinkSpatialUpsample(
+            c32, out_channels=c4, upsample_rate=8, upsample_mode=upsample_mode
+        )
+        self.s4_r32r8 = HRChannelShrinkSpatialUpsample(
+            c32, out_channels=c8, upsample_rate=4, upsample_mode=upsample_mode
+        )
+        self.s4_r32r16 = HRChannelShrinkSpatialUpsample(
+            c32, out_channels=c16, upsample_rate=2, upsample_mode=upsample_mode
+        )
         self.s4_r32r32 = HRSplitConcatShuffleBlock(c32)
 
         ################
-        #    Final
+        #    Head
         ################
-        self.up_r4r2 = nn.Upsample(scale_factor=2, mode=upsample_mode)
-        self.up_r8r2 = nn.Upsample(scale_factor=4, mode=upsample_mode)
-        self.up_r16r2 = nn.Upsample(scale_factor=8, mode=upsample_mode)
-        self.up_r32r2 = nn.Upsample(scale_factor=16, mode=upsample_mode)
+        self.head = head_cls(layer_settings=layer_settings, upsample_mode=upsample_mode)
 
+        ################################
+        #    Parameter Initialization
+        ################################
         self.initialize_params()
 
     def forward(self, x):
@@ -511,25 +579,24 @@ class HigherResolutionNet(nn.Module):
         r8 = self.branch_s4_r8d(self.branch_s4_r8c(self.branch_s4_r8b(self.branch_s4_r8a(r8))))
         r16 = self.branch_s4_r16d(self.branch_s4_r16c(self.branch_s4_r16b(self.branch_s4_r16a(r16))))
         r32 = self.branch_s4_r32d(self.branch_s4_r32c(self.branch_s4_r32b(self.branch_s4_r32a(r32))))
-        fused_r32 = self.s4_r2r32(r2) + self.s4_r4r32(r4) + self.s4_r8r32(r8) + self.s4_r16r32(r16) + self.s4_r32r32(r32)
-        fused_r16 = self.s4_r2r16(r2) + self.s4_r4r16(r4) + self.s4_r8r16(r8) + self.s4_r16r16(r16) + self.s4_r32r16(r32)
+        fused_r32 = (
+            self.s4_r2r32(r2) + self.s4_r4r32(r4) + self.s4_r8r32(r8) + self.s4_r16r32(r16) + self.s4_r32r32(r32)
+        )
+        fused_r16 = (
+            self.s4_r2r16(r2) + self.s4_r4r16(r4) + self.s4_r8r16(r8) + self.s4_r16r16(r16) + self.s4_r32r16(r32)
+        )
         fused_r8 = self.s4_r2r8(r2) + self.s4_r4r8(r4) + self.s4_r8r8(r8) + self.s4_r16r8(r16) + self.s4_r32r8(r32)
         fused_r4 = self.s4_r2r4(r2) + self.s4_r4r4(r4) + self.s4_r8r4(r8) + self.s4_r16r4(r16) + self.s4_r32r4(r32)
         fused_r2 = self.s4_r2r2(r2) + self.s4_r4r2(r4) + self.s4_r8r2(r8) + self.s4_r16r2(r16) + self.s4_r32r2(r32)
 
-        # Final
-        r4_up = self.up_r4r2(fused_r4)
-        r8_up = self.up_r8r2(fused_r8)
-        r16_up = self.up_r16r2(fused_r16)
-        r32_up = self.up_r32r2(fused_r32)
-
-        return torch.cat((fused_r2, r4_up, r8_up, r16_up, r32_up), dim=1)
+        # Head
+        return self.head(fused_r2, fused_r4, fused_r8, fused_r16, fused_r32)
 
     def initialize_params(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight.data, mode='fan_in', nonlinearity='relu')
-                if hasattr(m, 'bias') and m.bias is not None:
+                nn.init.kaiming_normal_(m.weight.data, mode="fan_in", nonlinearity="relu")
+                if hasattr(m, "bias") and m.bias is not None:
                     m.bias.data.zero_()
             # !!!IMPORTANT: batchnorm must be initialized and initialized as follows to meet quantization requirements.
             elif isinstance(m, nn.BatchNorm1d) or isinstance(m, nn.BatchNorm2d):
